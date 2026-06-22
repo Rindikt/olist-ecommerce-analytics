@@ -1,14 +1,20 @@
 import os
 import pandas as pd
 from sqlalchemy import create_engine
-import sqlite3
+
+_engine = None
 
 def get_engine():
+    global _engine
+    if _engine is not None:
+        return _engine
+
     if os.getenv('POSTGRES_USER'):
-        return create_engine(f"postgresql://...")
+        _engine = create_engine(f"postgresql://{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}@localhost:5435/{os.getenv('POSTGRES_DB')}")
     else:
-        engine = create_engine('sqlite:///:memory:')
-        pd.read_csv('data_raw/olist_orders_dataset.csv').to_sql('orders', engine, index=False)
-        pd.read_csv('data_raw/olist_order_items_dataset.csv').to_sql('order_items', engine, index=False)
-        pd.read_csv('data_raw/olist_customers_dataset.csv').to_sql('customers', engine, index=False)
-        return engine
+        _engine = create_engine('sqlite:///:memory:')
+        pd.read_csv('data_raw/olist_orders_dataset.csv').to_sql('orders', _engine, index=False)
+        pd.read_csv('data_raw/olist_order_items_dataset.csv').to_sql('order_items', _engine, index=False)
+        pd.read_csv('data_raw/olist_customers_dataset.csv').to_sql('customers', _engine, index=False)
+
+    return _engine
