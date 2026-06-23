@@ -8,11 +8,16 @@ import pandas as pd
 import seaborn as sns
 import streamlit as st
 
-from db_utils import get_engine
+from db_utils import get_engine, sql_to_sqlite
 
 
 def get_data(query):
     engine = get_engine()
+
+    # Если мы в режиме SQLite, применяем переводчик
+    if "sqlite" in str(engine.url):
+        query = sql_to_sqlite(query)
+
     return pd.read_sql(query, engine)
 
 st.set_page_config(page_title="Olist Analytics", layout="wide")
@@ -55,6 +60,7 @@ with tab1:
         WHERE customer_city IN (SELECT customer_city FROM top_cities)
         ORDER BY 1, 2;
         """
+
         df = get_data(my_query)
         pivot_revenue = df.pivot(index='month_order', columns='customer_city', values='total_revenue')
         pivot_avg = df.pivot(index='month_order', columns='customer_city', values='avg_order_value')
@@ -277,7 +283,13 @@ with tab3:
         ORDER BY repeat_rate DESC
         LIMIT 10;
         """
-        return get_data(query_cities)
+        df = get_data(query_cities)
+        if 'p90_delivery_days' not in df.columns:
+            # P90 через Pandas
+            # (предполагаем, что запрос возвращает delivery_days, если нет - нужно добавить в SELECT)
+            df['p90_delivery_days'] = df.groupby('month')['delivery_days'].transform(lambda x: x.quantile(0.9))
+
+        return df
 
     try:
         data = load_cohort_data()
