@@ -1,24 +1,19 @@
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 import streamlit as st
-
-from db_utils import get_engine, sql_to_sqlite
-
+from db_utils import get_engine
 
 def get_data(query):
-    engine = get_engine()
-
-    # Если мы в режиме SQLite, применяем переводчик
-    if "sqlite" in str(engine.url):
-        query = sql_to_sqlite(query)
-
-    return pd.read_sql(query, engine)
+    return pd.read_sql(query, get_engine())
 
 st.set_page_config(page_title="Olist Analytics", layout="wide")
 st.title("📊 Аналитический дашборд: Olist E-commerce")
@@ -28,46 +23,38 @@ tab1, tab2, tab3 = st.tabs(["Финансы", "Логистика", "Клиен�
 with tab1:
     @st.cache_data
     def load_revenue_data():
-        my_query = """
-        WITH order_totals AS (
-            -- Сначала считаем сумму по каждому заказу (это наш честный "чек")
-            SELECT order_id, 
-                   SUM(price + freight_value) AS order_value
-            FROM order_items
-            GROUP BY order_id
-        ),
-        monthly_stats AS (
-            SELECT 
-                DATE_TRUNC('month', o.order_purchase_timestamp)::DATE AS month_order,
-                c.customer_city,
-                COUNT(o.order_id) AS total_orders,
-                SUM(ot.order_value) AS total_revenue,
-                ROUND(AVG(ot.order_value),2) AS avg_order_value -- А теперь считаем среднее от чеков!
-            FROM orders o
-            JOIN customers c ON o.customer_id = c.customer_id
-            JOIN order_totals ot ON o.order_id = ot.order_id
-            GROUP BY 1, 2
-        ),
-        top_cities AS (
-            -- Возвращаем фильтр по выручке
-            SELECT customer_city
-            FROM monthly_stats
-            GROUP BY customer_city
-            ORDER BY SUM(total_revenue) DESC
-            LIMIT 5
-        )
-        SELECT * FROM monthly_stats 
-        WHERE customer_city IN (SELECT customer_city FROM top_cities)
-        ORDER BY 1, 2;
+        # Забираем чистые данные из таблиц
+        query = """
+        SELECT 
+            o.order_purchase_timestamp,
+            c.customer_city,
+            oi.price + oi.freight_value AS order_value
+        FROM orders o
+        JOIN customers c ON o.customer_id = c.customer_id
+        JOIN order_items oi ON o.order_id = oi.order_id
         """
+        df = get_data(query)
 
-        df = get_data(my_query)
-        pivot_revenue = df.pivot(index='month_order', columns='customer_city', values='total_revenue')
-        pivot_avg = df.pivot(index='month_order', columns='customer_city', values='avg_order_value')
-        pivot_revenue = pivot_revenue.iloc[:-1]
-        pivot_avg = pivot_avg.iloc[:-1]
-        return pivot_revenue, pivot_avg
+        # Приводим типы и считаем месяц
+        df['order_purchase_timestamp'] = pd.to_datetime(df['order_purchase_timestamp'])
+        df['month_order'] = df['order_purchase_timestamp'].dt.to_period('M').dt.to_timestamp()
 
+        # Агрегация данных
+        monthly_stats = df.groupby(['month_order', 'customer_city']).agg(
+            total_revenue=('order_value', 'sum'),
+            avg_order_value=('order_value', 'mean')
+        ).reset_index()
+
+        # Фильтр топ-5 городов по общей выручке
+        top_cities = monthly_stats.groupby('customer_city')['total_revenue'].sum().nlargest(5).index
+        df_filtered = monthly_stats[monthly_stats['customer_city'].isin(top_cities)]
+
+        # Подготовка данных для визуализации (pivot)
+        pivot_revenue = df_filtered.pivot(index='month_order', columns='customer_city', values='total_revenue')
+        pivot_avg = df_filtered.pivot(index='month_order', columns='customer_city', values='avg_order_value')
+
+        # Убираем последний неполный месяц, если нужно
+        return pivot_revenue.iloc[:-1], pivot_avg.iloc[:-1]
 
     st.header("Финансовые показатели")
 
@@ -80,24 +67,19 @@ with tab1:
 
         with col_graph:
             fig, ax1 = plt.subplots(figsize=(10, 5))
-
             total_revenue.plot(kind='bar', ax=ax1, color='skyblue', alpha=0.7, label='Выручка')
             ax1.set_ylabel('Выручка (BRL)', color='blue')
-
             ax2 = ax1.twinx()
             avg_check.plot(kind='line', ax=ax2, color='darkred', marker='o', linewidth=2, label='Средний чек')
             ax2.set_ylabel('Средний чек (BRL)', color='darkred')
-
             plt.title('Динамика выручки и среднего чека')
             st.pyplot(fig)
 
         with col_stats:
             rev_delta = ((total_revenue.iloc[-1] - total_revenue.iloc[-2]) / total_revenue.iloc[-2]) * 100
             aov_delta = ((avg_check.iloc[-1] - avg_check.iloc[-2]) / avg_check.iloc[-2]) * 100
-
             st.metric("Выручка (последний мес.)", f"{total_revenue.iloc[-1]:,.0f} BRL", f"{rev_delta:.1f}%")
             st.metric("Средний чек", f"{avg_check.iloc[-1]:,.2f} BRL", f"{aov_delta:.1f}%")
-
             st.write("---")
             st.caption("Показатели отображают динамику последнего отчетного месяца к предыдущему.")
 
@@ -116,8 +98,6 @@ with tab1:
                 * **Декабрьская просадка:** Наблюдается снижение активности в декабре, что может быть связано с исчерпанием спроса после ноябрьских промо-акций.
                 * **Рекомендация:** Для нивелирования декабрьского спада целесообразно рассмотреть запуск программы удержания (retention) или дополнительные маркетинговые коммуникации в начале декабря.
                 """)
-
-
     except Exception as e:
         st.error(f"Ошибка при обработке данных: {e}")
 
@@ -126,28 +106,33 @@ with tab2:
     st.header("Анализ логистики")
     @st.cache_data
     def load_logistics_data():
-        my_query = """
-        WITH order_delivery_metrics AS (
-        SELECT order_id,
-        	   order_purchase_timestamp,
-        	   order_delivered_customer_date,
-        	   EXTRACT(DAY FROM (order_delivered_customer_date - order_purchase_timestamp)) AS delivery_days,
-        	   DATE_TRUNC('month', order_purchase_timestamp)::DATE AS month   
-        FROM orders
-        WHERE order_delivered_customer_date IS NOT NULL 
-        )
-
-        SELECT month,
-               COUNT(order_id) AS total_orders,
-        	   ROUND(AVG(delivery_days),2) AS avg_delivery_days,
-        	   PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY delivery_days) AS p90_delivery_days,
-        	   MAX(delivery_days) AS max_delivery_days,
-               SUM(CASE WHEN delivery_days > 30 THEN 1 ELSE 0 END) AS late_orders_count
-        FROM order_delivery_metrics
-        GROUP BY month
-        ORDER BY month
+        # Забираем только необходимые сырые данные без SQL-агрегатов
+        query = """
+        SELECT order_id, order_purchase_timestamp, order_delivered_customer_date 
+        FROM orders 
+        WHERE order_delivered_customer_date IS NOT NULL
         """
-        return get_data(my_query)
+        df = get_data(query)
+
+        # Приводим к формату дат
+        df['order_purchase_timestamp'] = pd.to_datetime(df['order_purchase_timestamp'])
+        df['order_delivered_customer_date'] = pd.to_datetime(df['order_delivered_customer_date'])
+
+        # Считаем разницу в днях
+        df['delivery_days'] = (df['order_delivered_customer_date'] - df['order_purchase_timestamp']).dt.days
+        # Создаем колонку месяца
+        df['month'] = df['order_purchase_timestamp'].dt.to_period('M').dt.to_timestamp()
+
+        # Агрегируем данные (аналог твоего SQL запроса)
+        report = df.groupby('month').agg(
+            total_orders=('order_id', 'count'),
+            avg_delivery_days=('delivery_days', 'mean'),
+            p90_delivery_days=('delivery_days', lambda x: x.quantile(0.9)),
+            max_delivery_days=('delivery_days', 'max'),
+            late_orders_count=('delivery_days', lambda x: (x > 30).sum())
+        ).reset_index()
+
+        return report.sort_values('month')
 
     try:
         df = load_logistics_data()
@@ -213,7 +198,7 @@ with tab2:
         with st.expander("Показать подробный анализ"):
             st.markdown("""
                 * **Качество данных:** Первые два месяца характеризуются низкой статистической значимостью (единичные заказы), что создает аномальные пики на графике. Эти данные были приняты к сведению, но не учитываются при формировании выводов о стабильности системы.
-                * **Эффективность логистики:**  Начиная с марта, наблюдается устойчивое снижение времени доставки (среднее и P90). Это произошло на фоне выхода общего объема заказов на «плато», что говорит о достижении системой оптимального рабочего ритма.
+                * **Эффективность логистики:** Начиная с марта, наблюдается устойчивое снижение времени доставки (среднее и P90). Это произошло на фоне выхода общего объема заказов на «плато», что говорит о достижении системой оптимального рабочего ритма.
                 * **Анализ критических задержек:** Исследование доли заказов со сроком доставки > 30 дней выявило «период турбулентности» (октябрь 2017 – март 2018). В этот промежуток доля «долгих» доставок была значительно выше целевого уровня в 2.5%, что стало следствием резкого роста нагрузки.
                 * **Результат оптимизации:** К апрелю 2018 года компании удалось вернуть долю критических задержек к историческому минимуму (~2.5%).
                 * **Управленческий инсайт:** Система демонстрирует высокую реактивность. После периода операционного стресса конца 2017 года, логистическая сеть была успешно адаптирована под текущие объемы. Рост нагрузки более не приводит к «взрывному» росту времени доставки, что подтверждает эффективность принятых мер по управлению цепочкой поставок.
@@ -227,69 +212,52 @@ with tab3:
 
     @st.cache_data
     def load_cohort_data():
-        my_query = """
-        WITH order_months AS (
-            SELECT 
-                c.customer_unique_id,
-                DATE_TRUNC('month', o.order_purchase_timestamp)::DATE AS order_month,
-                DATE_TRUNC('month', MIN(o.order_purchase_timestamp) OVER(PARTITION BY c.customer_unique_id))::DATE AS cohort_month
-            FROM orders o
-            JOIN customers c ON o.customer_id = c.customer_id
-        )
-        SELECT 
-            cohort_month,
-            (order_month - cohort_month) / 30 AS cohort_age,
-            COUNT(DISTINCT customer_unique_id) AS active_customers
-        FROM order_months
-        GROUP BY 1, 2
-        ORDER BY 1, 2;
+        # Забираем только сырые данные
+        query = """
+        SELECT c.customer_unique_id, o.order_purchase_timestamp
+        FROM orders o
+        JOIN customers c ON o.customer_id = c.customer_id
         """
-        df = get_data(my_query)
+        df = get_data(query)
+        df['order_purchase_timestamp'] = pd.to_datetime(df['order_purchase_timestamp'])
+        df['month'] = df['order_purchase_timestamp'].dt.to_period('M')
 
-        pivot = df.pivot(index='cohort_month', columns='cohort_age', values='active_customers')
+        # Определяем месяц первой покупки для каждого клиента
+        df['cohort'] = df.groupby('customer_unique_id')['month'].transform('min')
 
+        # Считаем возраст когорты
+        df['cohort_age'] = (df['month'] - df['cohort']).apply(lambda x: x.n)
+
+        # Считаем активных клиентов
+        cohort_df = df.groupby(['cohort', 'cohort_age'])['customer_unique_id'].nunique().reset_index()
+        pivot = cohort_df.pivot(index='cohort', columns='cohort_age', values='customer_unique_id')
+
+        # Считаем Retention
         pivot_pct = pivot.divide(pivot.iloc[:, 0], axis=0)
-        cohort_pivot_clean = pivot_pct.drop(columns=[0]).iloc[3:-2]
-        return cohort_pivot_clean
+        return pivot_pct.drop(columns=[0]).iloc[3:-2]
 
     @st.cache_data
     def load_cities_loyalty():
+        # Упрощенный запрос для получения данных по городам
         query_cities = """
-        SELECT 
-            c.customer_city,
-            COUNT(DISTINCT c.customer_unique_id) AS total_customers,
-            COUNT(DISTINCT CASE WHEN counts.order_count > 1 THEN c.customer_unique_id END) AS repeat_customers,
-            ROUND(100.0 * COUNT(DISTINCT CASE WHEN counts.order_count > 1 THEN c.customer_unique_id END) / COUNT(DISTINCT c.customer_unique_id), 2) AS repeat_rate
+        SELECT c.customer_city, c.customer_unique_id, o.order_id
         FROM customers c
-        JOIN (
-            -- Сначала считаем заказы на каждого уникального клиента
-            SELECT 
-                customer_id, 
-                customer_unique_id 
-            FROM customers
-        ) cust_map ON c.customer_unique_id = cust_map.customer_unique_id
-        JOIN orders o ON cust_map.customer_id = o.customer_id
-        JOIN (
-            -- Подзапрос для определения количества заказов на клиента
-            SELECT 
-                customer_unique_id, 
-                COUNT(order_id) as order_count 
-            FROM orders o
-            JOIN customers c ON o.customer_id = c.customer_id
-            GROUP BY customer_unique_id
-        ) counts ON c.customer_unique_id = counts.customer_unique_id
-        GROUP BY c.customer_city
-        HAVING COUNT(DISTINCT c.customer_unique_id) > 100 -- фильтр городов по репрезентативности
-        ORDER BY repeat_rate DESC
-        LIMIT 10;
+        JOIN orders o ON c.customer_id = o.customer_id
         """
         df = get_data(query_cities)
-        if 'p90_delivery_days' not in df.columns:
-            # P90 через Pandas
-            # (предполагаем, что запрос возвращает delivery_days, если нет - нужно добавить в SELECT)
-            df['p90_delivery_days'] = df.groupby('month')['delivery_days'].transform(lambda x: x.quantile(0.9))
 
-        return df
+        # Считаем заказы на клиента и всего на город в Pandas
+        cust_counts = df.groupby('customer_unique_id')['order_id'].count()
+        df = df.merge(cust_counts.rename('order_count'), on='customer_unique_id')
+
+        city_stats = df.groupby('customer_city').agg(
+            total_customers=('customer_unique_id', 'nunique'),
+            repeat_customers=('customer_unique_id', lambda x: x[df.loc[x.index, 'order_count'] > 1].nunique())
+        )
+
+        city_stats = city_stats[city_stats['total_customers'] > 100].copy()
+        city_stats['repeat_rate'] = (city_stats['repeat_customers'] / city_stats['total_customers']) * 100
+        return city_stats.sort_values('repeat_rate', ascending=False).head(10)
 
     try:
         data = load_cohort_data()
@@ -299,9 +267,7 @@ with tab3:
 
         with col1:
             fig, ax = plt.subplots(figsize=(10, 6))
-
-            sns.heatmap(data, annot=True, fmt='.1%', cmap='YlGnBu',
-                        annot_kws={"size": 7}, ax=ax)
+            sns.heatmap(data, annot=True, fmt='.1%', cmap='YlGnBu', annot_kws={"size": 7}, ax=ax)
             st.pyplot(fig)
             st.write("### Топ городов по лояльности")
             styled_df = result_cities.style.format({
@@ -324,7 +290,7 @@ with tab3:
         with st.expander("Показать подробный анализ"):
             st.markdown("""
                 * **Низкий Retention (~0.5%):** Площадка носит транзакционный характер. Пользователи приходят за конкретным товаром, а не за брендом.
-                * **Стабильность базы:**  Отсутствие резких провалов или «взрывов» лояльности в когортах указывает на то, что текущие операционные показатели стабильны, но не стимулируют повторные покупки.
+                * **Стабильность базы:** Отсутствие резких провалов или «взрывов» лояльности в когортах указывает на то, что текущие операционные показатели стабильны, но не стимулируют повторные покупки.
                 * **География лояльности:** Анализ повторных покупок в разрезе городов показал наличие устойчивых региональных различий. В городах-лидерах Retention-rate достигает ~3.5–3.8% (при среднем по компании ~3.1%). Это указывает на то, что лояльность не распределена равномерно и может зависеть от качества локальной логистической инфраструктуры. Рекомендуется провести дополнительное исследование этих регионов для масштабирования успешных логистических практик на всю сеть.
                 * **Стратегический фокус:** Стратегия роста компании должна фокусироваться на эффективности каналов привлечения (CAC) и работе с ассортиментом, так как полагаться на органический возврат текущей базы при текущих показателях недостаточно для агрессивного роста выручки.
                 """)
